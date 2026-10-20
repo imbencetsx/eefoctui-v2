@@ -1,0 +1,28 @@
+[package]
+name = "eefoctuiv2"
+version = "0.1.0"
+edition = "2024"
+description = "A tactile, fullscreen Docker and Compose control room"
+license = "MIT"
+rust-version = "1.95"
+
+[[bin]]
+name = "efc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = "0.30.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
+
