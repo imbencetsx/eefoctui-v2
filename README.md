@@ -45,8 +45,8 @@ to use `Ctrl+Q`; exiting efc leaves containers running.
   service, ports, CPU, memory, network I/O, block I/O, process count, and CPU history.
   Open complete available log history (stdout and stderr) with live following,
   scrolling, horizontal panning, line numbers and search, or the complete inspect JSON.
-  Use **Attach** for an embedded workspace: log history above, the running
-  container's main-process terminal below, with ANSI colors, cursor movement,
+  Use **Attach** for a single **Container console** box: live logs above and a
+  compact main-process console directly underneath, with ANSI colors, cursor movement,
   keyboard input, paste and terminal resizing. **Ctrl+Q**, **Ctrl+C**, or **Ctrl+P then
   Ctrl+Q** detach and return to efc while keeping the container running.
 - **Compose:** automatically discover projects through labels on all containers,
@@ -94,9 +94,13 @@ In confirmation dialogs, use `Tab` or arrows to choose, `Enter` to select,
 
 ## Embedded terminal & logs
 
-The **Attach** button (`a`) opens both panes inside efc. **Logs** (`l`) opens the
-same history viewer without attaching stdin; stopped containers can be viewed too.
-The focused pane has a glacier border and a `▸` marker. Click a pane or its keycap,
+The **Attach** button (`a`) opens one **Container console** box inside efc.
+Live logs fill the upper area, with the attached console directly beneath a
+shared divider. Logs follow new output automatically when opened. **Logs** (`l`)
+opens the same history viewer without attaching stdin; stopped containers can be
+viewed too.
+The focused area has a glacier `▸` marker in the box header or console divider.
+Click an area or its keycap,
 or press **Ctrl+W** / **Shift+Tab**, to change focus. Ordinary keys, including Tab
 completion and Escape, reach the main process while the terminal has focus.
 

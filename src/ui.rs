@@ -276,7 +276,7 @@ fn console(frame: &mut Frame, app: &mut App, area: Rect) {
     let parts = rows(
         area,
         [
-            Constraint::Length(2),
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Length(5),
             Constraint::Length(1),
@@ -284,49 +284,55 @@ fn console(frame: &mut Frame, app: &mut App, area: Rect) {
         ],
     );
     let session = app.console.as_mut().unwrap();
-    let body = if session.show_terminal {
-        rows(
-            parts[1],
-            [
-                Constraint::Percentage(55),
-                Constraint::Length(1),
-                Constraint::Percentage(45),
-            ],
+    let box_area = parts[1];
+    let block = panel(format!(" Container console / {} ", session.target.name))
+        .title_top(
+            Line::from(if session.focus == Focus::Logs {
+                " ▸ Logs "
+            } else {
+                " Logs "
+            })
+            .fg(if session.focus == Focus::Logs {
+                GLACIER
+            } else {
+                MUTED
+            })
+            .alignment(Alignment::Right),
         )
-        .to_vec()
+        .border_style(Style::default().fg(ICE_EDGE));
+    let content = block.inner(box_area);
+    frame.render_widget(block, box_area);
+    let console_height = if session.show_terminal {
+        (content.height / 4)
+            .clamp(3, 8)
+            .min(content.height.saturating_sub(2))
     } else {
-        vec![parts[1], Rect::default(), Rect::default()]
+        0
     };
-    let log_block = panel(format!(
-        " {}Log history · {} ",
-        if session.focus == Focus::Logs {
-            "▸ "
-        } else {
-            ""
-        },
-        if session.following { "live" } else { "paused" }
-    ))
-    .border_style(Style::default().fg(if session.focus == Focus::Logs {
-        GLACIER
-    } else {
-        WINE_EDGE
-    }));
-    let log_inner = log_block.inner(body[0]);
-    frame.render_widget(log_block, body[0]);
-    session.log_rect = body[0];
+    let divider_height = u16::from(session.show_terminal && content.height > 0);
+    let log_height = content
+        .height
+        .saturating_sub(console_height + divider_height);
+    let log_inner = Rect::new(content.x, content.y, content.width, log_height);
+    let console_inner = Rect::new(
+        content.x,
+        content.y + log_height + divider_height,
+        content.width,
+        console_height,
+    );
+    session.log_rect = log_inner;
     session.log_height = usize::from(log_inner.height).max(1);
     session.clamp_logs();
     let stats = session.history.stats();
     let title = Line::from(vec![
         Span::styled(
             format!(
-                " {} / {}",
-                if session.show_terminal {
-                    "Attached workspace"
+                " {}",
+                if session.following {
+                    "● Live logs"
                 } else {
-                    "Container logs"
-                },
-                session.target.name
+                    "Ⅱ Scrolling history"
+                }
             ),
             Style::default().fg(GLACIER).bold(),
         ),
@@ -423,23 +429,44 @@ fn console(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     session.terminal_rect = Rect::default();
     if session.show_terminal {
-        let block = panel(format!(
-            " {}Terminal · {} ",
-            if session.focus == Focus::Terminal {
-                "▸ "
-            } else {
-                ""
-            },
-            session.terminal_status
-        ))
-        .border_style(Style::default().fg(if session.focus == Focus::Terminal {
-            GLACIER
-        } else {
-            WINE_EDGE
-        }));
-        let inner = block.inner(body[2]);
-        frame.render_widget(block, body[2]);
-        session.terminal_rect = body[2];
+        let divider_y = log_inner.bottom();
+        if divider_height > 0 {
+            let divider = format!(
+                "├{}┤",
+                "─".repeat(box_area.width.saturating_sub(2) as usize)
+            );
+            text(
+                frame,
+                Rect::new(box_area.x, divider_y, box_area.width, 1),
+                Line::from(divider).fg(ICE_EDGE),
+            );
+            text(
+                frame,
+                Rect::new(
+                    content.x + u16::from(content.width > 0),
+                    divider_y,
+                    content.width.saturating_sub(2),
+                    1,
+                ),
+                Line::from(format!(
+                    " {}Console · {} ",
+                    if session.focus == Focus::Terminal {
+                        "▸ "
+                    } else {
+                        ""
+                    },
+                    session.terminal_status
+                ))
+                .fg(if session.focus == Focus::Terminal {
+                    GLACIER
+                } else {
+                    MUTED
+                })
+                .bg(BG),
+            );
+        }
+        let inner = console_inner;
+        session.terminal_rect = inner;
         session.resize(inner.width, inner.height);
         let screen = session.parser.screen();
         for y in 0..inner.height {
@@ -526,7 +553,7 @@ fn console(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(if session.focus == Focus::Terminal {
             " Ctrl+W panes  PgUp/PgDn logs  Tab completes  Ctrl+Q / Ctrl+C back"
         } else {
-            " ↑↓ scroll  Home/End first/live  ←→ pan  / search  n next  Ctrl+W terminal"
+            " ↑↓ scroll  Home/End first/live  ←→ pan  / search  n next  Ctrl+W console"
         })
         .fg(GLACIER),
     );
@@ -545,7 +572,7 @@ fn console(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         (
             if show_terminal {
-                "Terminal"
+                "Console"
             } else {
                 "a  Attach"
             },
@@ -1966,11 +1993,28 @@ mod tests {
             let session = app.console.as_ref().unwrap();
             assert!(session.terminal_rect.bottom() <= height);
             assert!(session.log_rect.right() <= width);
+            let buffer = terminal.backend().buffer();
+            let symbols: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert_eq!(
+                symbols.matches('╭').count(),
+                1,
+                "Console must have one outer box"
+            );
+            assert_eq!(
+                symbols.matches('╰').count(),
+                1,
+                "Console must have one outer box"
+            );
+            assert_eq!(
+                symbols.matches('├').count(),
+                1,
+                "Console belongs below logs, sharing its border"
+            );
             assert_eq!(
                 session.parser.screen().size(),
                 (
-                    session.terminal_rect.height.saturating_sub(2).max(1),
-                    session.terminal_rect.width.saturating_sub(2).max(1),
+                    session.terminal_rect.height.max(1),
+                    session.terminal_rect.width.max(1),
                 )
             );
             assert!(

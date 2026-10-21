@@ -342,7 +342,7 @@ def attach_flow(root):
         terminal.until("ATTACH READY")
         terminal.send("exit\r")
         terminal.until("Attach session ended")
-        terminal.until("Attached workspace / api")
+        terminal.until("Container console / api")
         terminal.send("\x11")
         terminal.until("Detached · api")
         terminal.quit()
@@ -383,7 +383,7 @@ def embedded_history_flow(root):
     try:
         terminal.until("fake-context")
         terminal.send("a")
-        terminal.until("Attached workspace / api")
+        terminal.until("Container console / api")
         terminal.until("ATTACH READY")
         terminal.until("LIVE-")
         assert b"\x1b[?1049l" not in terminal.output, "Attach left the TUI's alternate screen"
@@ -407,7 +407,7 @@ def embedded_history_flow(root):
         terminal.until("LIVE-")
         terminal.until("following")
         # Click inside the terminal: subsequent ordinary keys go to the process.
-        row = next(y for y, line in enumerate(terminal.screen.display) if "Terminal ·" in line)
+        row = next(y for y, line in enumerate(terminal.screen.display) if "Console ·" in line)
         terminal.send(f"\x1b[<0;5;{row + 3}M\x1b[<0;5;{row + 3}m")
         terminal.send("\x1b[200~pasted é\t\x1b[201~")
         terminal.until("ATTACH INPUT")
