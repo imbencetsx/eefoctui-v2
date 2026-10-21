@@ -43,6 +43,10 @@ class Terminal:
     def send(self, keys):
         os.write(self.fd, keys.encode())
 
+    def resize(self, width, height):
+        self.screen.resize(lines=height, columns=width)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+
     def pump(self, duration=0.15):
         end = time.monotonic() + duration
         while time.monotonic() < end:
@@ -94,7 +98,7 @@ class Terminal:
 
 
 FIXTURE = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 args = sys.argv[1:]
 root = Path(os.environ["EFC_FIXTURE"])
@@ -106,7 +110,19 @@ if args[0] == "ps":
     assert "--all" in args and "--no-trunc" in args
     assert "com.docker.compose.project.config_files" in args[-1]
     for name, running in state.items():
-        print(json.dumps(dict(ID="id-" + name, Names=name, Image=name + ":test", State="running" if running else "exited", Status="Up (healthy)" if running else "Exited (0)", Ports="127.0.0.1:48992->80/tcp" if running else "", Project="fixture-project", Service=name, ConfigFiles=str(root / "my stack/compose.yaml") + "," + str(root / "my stack/override.yaml"), WorkingDir=str(root / "my stack"))))
+        row = dict(ID="id-" + name, Names=name, Image=name + ":test", State="running" if running else "exited", Status="Up (healthy)" if running else "Exited (0)", Ports="127.0.0.1:48992->80/tcp" if running else "", Project="fixture-project", Service=name, ConfigFiles=str(root / "my stack/compose.yaml") + "," + str(root / "my stack/override.yaml"), WorkingDir=str(root / "my stack"))
+        labels = {"com.docker.compose.project": row["Project"], "com.docker.compose.service": row["Service"], "com.docker.compose.project.config_files": row["ConfigFiles"], "com.docker.compose.project.working_dir": row["WorkingDir"]}
+        def json_field(match):
+            expression = match.group(1).strip()
+            label = re.fullmatch(r'\(\.Label "([^"]+)"\)', expression)
+            value = labels.get(label.group(1), "") if label else row[expression.removeprefix(".")]
+            return json.dumps(value)
+        # Render the template efc actually passed, so broken JSON punctuation is
+        # caught rather than hidden behind a hand-written JSON fixture response.
+        output = re.sub(r'\{\{json (.*?)\}\}', json_field, args[-1])
+        if os.environ.get("EFC_FIXTURE_BAD_PS"):
+            output = output[:-1]
+        print(output)
 elif args[0] == "stats":
     for name, running in state.items():
         if running:
@@ -124,7 +140,37 @@ elif args[0] == "logs":
     print("fixture standard output")
     print("fixture standard error", file=sys.stderr)
 elif args[0] == "inspect":
-    print(json.dumps([dict(Name=args[-1], State=dict(Status="running"))]))
+    if "--format" in args:
+        assert args[args.index("--format") + 1] == "{{json .Config}}"
+        print(json.dumps(dict(Tty=not bool(os.environ.get("EFC_ATTACH_CANONICAL")), StdinOnce=bool(os.environ.get("EFC_ATTACH_CANONICAL")))))
+    else:
+        print(json.dumps([dict(Name=args[-1], State=dict(Status="running"))]))
+elif args[0] == "attach":
+    import signal, tty
+    expected = ["--sig-proxy=false", "--detach-keys=ctrl-p,ctrl-q"]
+    if os.environ.get("EFC_ATTACH_CANONICAL"):
+        expected.append("--no-stdin")
+    assert args[1:] == expected + ["--", "id-api"]
+    assert sys.stdin.isatty() and sys.stdout.isatty()
+    if os.environ.get("EFC_ATTACH_FAIL"):
+        print("fixture attach refused", file=sys.stderr, flush=True)
+        sys.exit(42)
+    if not os.environ.get("EFC_ATTACH_CANONICAL"):
+        tty.setraw(sys.stdin.fileno())
+    def resized(*_):
+        size = os.get_terminal_size()
+        os.write(1, f"\r\nATTACH RESIZE {size.columns}x{size.lines}\r\n".encode())
+    signal.signal(signal.SIGWINCH, resized)
+    os.write(1, b"\r\nATTACH READY\r\n")
+    while True:
+        data = os.read(0, 4096)
+        if not data:
+            break
+        with (root / "attach-input").open("ab") as out:
+            out.write(data)
+        os.write(1, b"\r\nATTACH INPUT " + data.hex().encode() + b"\r\n")
+        if b"exit" in data:
+            break
 elif args[0] == "compose":
     if "config" in args:
         print(json.dumps(dict(name="fixture-project", services=dict(api={}, db={})))); sys.exit(0)
@@ -228,8 +274,93 @@ def live_fixture_flow(root):
     print("PASS Docker stats, safe cancel, start/stop, both log streams, inspect, multi-file Compose stop/up, real host port")
 
 
+def malformed_output_flow(root):
+    env = dict(PATH=str(root) + os.pathsep + os.environ["PATH"], EFC_FIXTURE=str(root), EFC_FIXTURE_BAD_PS="1")
+    terminal = Terminal([], env)
+    try:
+        terminal.until("Container data error")
+        terminal.until("fake-context")
+        assert "Docker is offline" not in terminal.text()
+        assert "Engine is offline" not in terminal.text()
+        assert "Docker replied" in terminal.text()
+        terminal.quit()
+    finally:
+        terminal.close()
+    print("PASS malformed container JSON is reported as a data error, with the engine still connected")
+
+
+def attach_flow(root):
+    env = dict(PATH=str(root) + os.pathsep + os.environ["PATH"], EFC_FIXTURE=str(root))
+    terminal = Terminal([], env)
+    try:
+        terminal.until("fake-context")
+        terminal.send("/api\r")
+        terminal.pump()
+        terminal.send("a")
+        terminal.until("ATTACH READY")
+        terminal.send("héllo\x1b[A\r")
+        terminal.until("ATTACH INPUT")
+        terminal.resize(124, 38)
+        terminal.until("ATTACH RESIZE 124x38")
+        terminal.send("\x11")
+        terminal.until("Detached · api")
+        terminal.until("fake-context")
+        assert (root / "attach-input").read_bytes() == "héllo\x1b[A\r".encode()
+        assert json.loads((root / "state.json").read_text())["api"], "Detach stopped the container"
+        assert " / api " in terminal.text(), "Attach lost the selected filter"
+        # Click the actual keycap after terminal restoration and resizing.
+        for y, row in enumerate(terminal.screen.display):
+            if "a Attach" in row:
+                x = row.index("a Attach") + 4
+                terminal.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m")
+                break
+        else:
+            raise AssertionError("Attach button is missing")
+        terminal.until("ATTACH READY")
+        terminal.send("\x10")
+        terminal.pump()
+        terminal.send("\x11")
+        terminal.until("Detached · api")
+        terminal.send("a")
+        terminal.until("ATTACH READY")
+        terminal.send("exit\r")
+        terminal.until("Attach session ended · api")
+        terminal.quit()
+    finally:
+        terminal.close()
+    for extra, expected in [
+        ({"EFC_ATTACH_CANONICAL": "1"}, "Detached · api"),
+        ({"EFC_ATTACH_FAIL": "1"}, "Attach exited with status 42."),
+    ]:
+        terminal = Terminal([], dict(env, **extra))
+        try:
+            terminal.until("fake-context")
+            terminal.send("a")
+            if "EFC_ATTACH_FAIL" in extra:
+                terminal.until(expected)
+                terminal.until("fixture attach refused")
+                terminal.send("\x1b")
+                terminal.pump()
+            else:
+                terminal.until("ATTACH READY")
+                terminal.until("Output-only session")
+                terminal.send("ignored input\r")
+                terminal.pump()
+                terminal.send("\x03")
+                terminal.until(expected)
+            terminal.quit()
+        finally:
+            terminal.close()
+    captured = (root / "attach-input").read_bytes()
+    assert not any(key in captured for key in (b"\x03", b"\x10", b"\x11")), captured
+    assert b"ignored input" not in captured, "Output-only attach forwarded stdin"
+    print("PASS Attach button/shortcut, raw Unicode/arrows, resize, Ctrl+Q/Ctrl+C/Ctrl+P,Q detach, natural exit, failure and terminal restoration")
+
+
 if __name__ == "__main__":
     assert BINARY.exists(), "Run cargo build first"
     demo_flow()
     with tempfile.TemporaryDirectory(prefix="efc-qa-") as directory:
         live_fixture_flow(Path(directory))
+        malformed_output_flow(Path(directory))
+        attach_flow(Path(directory))

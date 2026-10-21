@@ -1,4 +1,5 @@
 mod app;
+mod attach;
 mod backend;
 mod model;
 mod ui;
@@ -139,6 +140,48 @@ fn main() -> Result<()> {
                     _ => {}
                 },
                 _ => {}
+            }
+        }
+        if let Some(target) = app.pending_attach.take() {
+            execute!(io::stdout(), DisableMouseCapture)?;
+            ratatui::restore();
+            let result = attach::run(&target, || {
+                if let Some(rx) = &receiver {
+                    while let Ok(update) = rx.try_recv() {
+                        app.update(update);
+                    }
+                }
+            });
+            terminal = ratatui::try_init()?;
+            if !args.no_mouse {
+                execute!(io::stdout(), EnableMouseCapture)?;
+            }
+            match result {
+                Ok(attach::Outcome::Detached) => {
+                    app.tell(format!("Detached · {}", target.name), false)
+                }
+                Ok(attach::Outcome::Exited { code: 0, .. }) => {
+                    app.tell(format!("Attach session ended · {}", target.name), false)
+                }
+                Ok(attach::Outcome::Exited { code, output }) => {
+                    app.popup = Some(Popup::Text {
+                        title: format!("Attach · {}", target.name),
+                        content: format!(
+                            "Attach exited with status {code}.\n\n{}",
+                            ui::clean_text(&output)
+                        ),
+                        scroll: 0,
+                        horizontal: 0,
+                    })
+                }
+                Err(error) => {
+                    app.popup = Some(Popup::Text {
+                        title: format!("Attach · {}", target.name),
+                        content: format!("{error:#}"),
+                        scroll: 0,
+                        horizontal: 0,
+                    })
+                }
             }
         }
     }

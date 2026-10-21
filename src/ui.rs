@@ -282,6 +282,8 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         "○ connecting to Docker".into()
     } else if app.docker.error.is_some() {
         "○ Docker offline".into()
+    } else if app.docker.data_error.is_some() {
+        format!("● {} · container data error", nonempty(&app.docker.context))
     } else {
         format!("● {}", nonempty(&app.docker.context))
     };
@@ -290,7 +292,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(state).fg(if app.demo {
                 GLACIER
-            } else if app.docker.error.is_some() {
+            } else if app.docker.error.is_some() || app.docker.data_error.is_some() {
                 RED
             } else {
                 GREEN
@@ -462,11 +464,13 @@ fn container_tiles(containers: &[Container], width: u16) -> Line<'static> {
 }
 
 fn container_metric(frame: &mut Frame, app: &App, rect: Rect) {
-    let available = !app.loading && app.docker.error.is_none();
+    let available = !app.loading && app.docker.error.is_none() && app.docker.data_error.is_none();
     let total = app.docker.containers.len();
     let running = app.docker.containers.iter().filter(|c| c.running()).count();
     let mut description = if app.loading {
         "Waiting for the engine".into()
+    } else if app.docker.data_error.is_some() {
+        "Engine replied · retrying".into()
     } else if !available {
         "Engine is offline".into()
     } else {
@@ -483,6 +487,8 @@ fn container_metric(frame: &mut Frame, app: &App, rect: Rect) {
         ("Containers", GLACIER),
         if app.loading {
             "Connecting…".into()
+        } else if app.docker.data_error.is_some() {
+            "Data error".into()
         } else if available {
             format!("{total} containers")
         } else {
@@ -615,6 +621,12 @@ fn docker_connection_message(error: &str) -> String {
     )
 }
 
+fn docker_data_message(error: &str) -> String {
+    format!(
+        "\n  Docker replied, but efc could not decode the container list.\n\n  The engine is reachable. This is a data-format error,\n  not evidence that Docker is stopped.\n\n  Shift+R retries; update efc if the problem persists.\n\n  Details\n  {error}"
+    )
+}
+
 fn containers(frame: &mut Frame, app: &mut App, area: Rect) {
     let split = columns(
         area,
@@ -643,6 +655,13 @@ fn containers(frame: &mut Frame, app: &mut App, area: Rect) {
             table_area,
             "Docker is offline",
             docker_connection_message(error),
+        );
+    } else if let Some(error) = &app.docker.data_error {
+        empty(
+            frame,
+            table_area,
+            "Container data error",
+            docker_data_message(error),
         );
     } else {
         let compact = table_area.width < 76;
@@ -865,6 +884,13 @@ fn compose(frame: &mut Frame, app: &mut App, area: Rect) {
             parts[0],
             "Compose",
             format!("\n  Docker is unavailable: {error}"),
+        );
+    } else if let Some(error) = &app.docker.data_error {
+        empty(
+            frame,
+            parts[0],
+            "Container data error",
+            docker_data_message(error),
         );
     } else if count == 0 {
         empty(frame, parts[0], "Compose", "\n  No Compose projects found.\n\n  Projects are discovered from container labels, including\n  stopped containers. To create a new stack, launch:\n\n  efc --compose /path/to/compose.yaml\n\n  Then select the project and press U to bring it up.".into());
@@ -1139,8 +1165,11 @@ fn system(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn actions(frame: &mut Frame, app: &mut App, area: Rect) {
-    let available =
-        !app.busy && !app.loading && app.docker.error.is_none() && app.target().is_some();
+    let available = !app.busy
+        && !app.loading
+        && app.docker.error.is_none()
+        && app.docker.data_error.is_none()
+        && app.target().is_some();
     let mut controls = match app.view {
         View::Containers => vec![
             (
@@ -1156,6 +1185,12 @@ fn actions(frame: &mut Frame, app: &mut App, area: Rect) {
                 available && app.selected_container().is_some_and(Container::running),
             ),
             ("r  Restart", Control::Restart, YELLOW, available),
+            (
+                "a  Attach",
+                Control::Attach,
+                GLACIER,
+                available && app.selected_container().is_some_and(Container::running),
+            ),
             ("l  Logs", Control::Logs, TEXT, available),
             ("i  Inspect", Control::Inspect, TEXT, available),
         ],
@@ -1169,7 +1204,11 @@ fn actions(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     controls.push(("R  Refresh", Control::Refresh, TEXT, !app.busy));
     controls.push(("?  Help", Control::Help, TEXT, true));
-    let preferred_width = if area.width < 86 { 12 } else { 15 };
+    let preferred_width = if area.width >= controls.len() as u16 * 15 {
+        15
+    } else {
+        12
+    };
     let mut x = area.x;
     for (caption, control, tint, enabled) in controls {
         let width = preferred_width.max(caption.chars().count() as u16 + 3);
@@ -1205,6 +1244,11 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
         (
             " DEMO · simulated data and actions · launch efc for your real machine".into(),
             GLACIER,
+        )
+    } else if app.docker.data_error.is_some() {
+        (
+            " Docker connected · container data could not be decoded · R to retry".into(),
+            RED,
         )
     } else if app.docker.stats_error.is_some() {
         (
@@ -1281,7 +1325,7 @@ fn popup(frame: &mut Frame, app: &mut App, area: Rect) {
             area.width.saturating_sub(8).min(130),
             area.height.saturating_sub(6),
         ),
-        Some(Popup::Help) => (78, 27),
+        Some(Popup::Help) => (78, 30),
         Some(Popup::Confirm { .. }) => (68, 15),
         _ => (62, 13),
     };
@@ -1341,6 +1385,7 @@ fn popup(frame: &mut Frame, app: &mut App, area: Rect) {
                 label("s / x / r", "Start / stop / restart selection"),
                 label("u", "Compose up -d --no-recreate"),
                 label("l / i", "Container logs / inspect JSON"),
+                label("a", "Attach · Ctrl+Q / Ctrl+C return to efc"),
                 label("Shift+R", "Refresh Docker connection"),
                 label("Ctrl+L", "Refresh Docker connection"),
                 Line::from(""),

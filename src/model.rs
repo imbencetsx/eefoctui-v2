@@ -113,6 +113,7 @@ pub struct DockerSnapshot {
     pub engine: String,
     pub context: String,
     pub error: Option<String>,
+    pub data_error: Option<String>,
     pub stats_error: Option<String>,
     pub configured: Option<Project>,
     pub compose_error: Option<String>,
@@ -162,6 +163,12 @@ impl Target {
 pub struct Action {
     pub verb: Verb,
     pub target: Target,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachTarget {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]

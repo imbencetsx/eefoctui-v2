@@ -54,6 +54,7 @@ pub enum Control {
     Start,
     Stop,
     Restart,
+    Attach,
     Up,
     Logs,
     Inspect,
@@ -95,6 +96,7 @@ pub struct App {
     pub last_host: Option<Instant>,
     pub system_scroll: usize,
     pub pressed: Option<(String, Instant)>,
+    pub pending_attach: Option<AttachTarget>,
     sender: Option<SyncSender<Request>>,
 }
 
@@ -128,6 +130,7 @@ impl App {
             last_host: demo_mode.then(Instant::now),
             system_scroll: 0,
             pressed: None,
+            pending_attach: None,
             sender,
         };
         if demo_mode {
@@ -254,9 +257,14 @@ impl App {
     pub fn update(&mut self, update: Update) {
         match update {
             Update::Docker(docker) => {
-                if docker.error != self.docker.error || self.loading {
+                if docker.error != self.docker.error
+                    || docker.data_error != self.docker.data_error
+                    || self.loading
+                {
                     if let Some(error) = &docker.error {
                         self.record(format!("Docker offline · {error}"), true);
+                    } else if let Some(error) = &docker.data_error {
+                        self.record(format!("Docker data error · {error}"), true);
                     } else {
                         self.record(
                             format!(
@@ -374,6 +382,13 @@ impl App {
             self.tell("Docker is unavailable · refresh the connection first", true);
             return;
         }
+        if self.docker.data_error.is_some() {
+            self.tell(
+                "Container data is unavailable · refresh before managing containers",
+                true,
+            );
+            return;
+        }
         let Some(target) = self.target() else {
             self.tell("Select a container or Compose project first", true);
             return;
@@ -468,6 +483,43 @@ impl App {
             Control::Start => self.request_action(Verb::Start),
             Control::Stop => self.request_action(Verb::Stop),
             Control::Restart => self.request_action(Verb::Restart),
+            Control::Attach => {
+                if self.view != View::Containers {
+                    return;
+                }
+                if self.busy
+                    || self.loading
+                    || self.docker.error.is_some()
+                    || self.docker.data_error.is_some()
+                {
+                    self.tell(
+                        "Attach is unavailable while Docker is busy or disconnected",
+                        true,
+                    );
+                    return;
+                }
+                let Some(c) = self.selected_container() else {
+                    self.tell("Select a running container to attach", false);
+                    return;
+                };
+                if !c.running() {
+                    self.tell("Start this container before attaching", false);
+                    return;
+                }
+                let target = AttachTarget {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                };
+                if self.demo {
+                    self.popup = Some(Popup::Text {
+                        title: format!("Attach · {}", target.name),
+                        content: "DEMO · no real container is attached.\n\nIn live mode, Attach connects to the running container's main\nprocess with an interactive terminal.\n\nCtrl+Q or Ctrl+C detaches and returns to efc.\nCtrl+P, Ctrl+Q also detaches.\n\nAttach does not launch a shell or restart the container.".into(),
+                        scroll: 0, horizontal: 0,
+                    });
+                } else {
+                    self.pending_attach = Some(target);
+                }
+            }
             Control::Up => self.request_action(Verb::Up),
             Control::Logs | Control::Inspect => {
                 if self.view != View::Containers {
@@ -710,6 +762,7 @@ impl App {
             KeyCode::Char('s') => self.control(Control::Start),
             KeyCode::Char('x') => self.control(Control::Stop),
             KeyCode::Char('r') => self.control(Control::Restart),
+            KeyCode::Char('a') => self.control(Control::Attach),
             KeyCode::Char('u') => self.control(Control::Up),
             KeyCode::Char('l') => self.control(Control::Logs),
             KeyCode::Char('i') | KeyCode::Enter => self.control(Control::Inspect),
@@ -792,5 +845,30 @@ mod tests {
         app.update(Update::Docker(snap));
         assert_eq!(app.selected_container().unwrap().name, "redis");
         assert!(!app.busy);
+    }
+    #[test]
+    fn attach_requires_a_running_container_and_respects_input_focus() {
+        let mut app = App::new(true, None);
+        app.key(key(KeyCode::Char('a')));
+        assert!(matches!(app.popup, Some(Popup::Text { .. })));
+        assert!(app.pending_attach.is_none());
+        app.popup = None;
+        app.demo = false;
+        app.control(Control::Attach);
+        assert_eq!(
+            app.pending_attach.take().unwrap().id,
+            app.selected_container().unwrap().id
+        );
+        app.busy = true;
+        app.control(Control::Attach);
+        assert!(app.pending_attach.is_none());
+        app.busy = false;
+        app.docker.containers[0].state = "exited".into();
+        app.control(Control::Attach);
+        assert!(app.pending_attach.is_none());
+        app.key(key(KeyCode::Char('/')));
+        app.key(key(KeyCode::Char('a')));
+        assert_eq!(app.query, "a");
+        assert!(app.pending_attach.is_none());
     }
 }

@@ -43,6 +43,9 @@ to use `Ctrl+Q`; exiting efc leaves containers running.
 - **Containers:** start, gracefully stop, and restart; inspect state, image, Compose
   service, ports, CPU, memory, network I/O, block I/O, process count, and CPU history.
   Open the last 250 log lines (both stdout and stderr) or the complete inspect JSON.
+  Use **Attach** to connect to a running container's main process, with live output,
+  keyboard input and terminal resizing. **Ctrl+Q**, **Ctrl+C**, or **Ctrl+P then
+  Ctrl+Q** detach and return to efc while keeping the container running.
 - **Compose:** automatically discover projects through labels on all containers,
   including stopped ones. Start, stop, or restart a whole project; bring up missing
   services using `up --detach --no-recreate`. Discovered multi-file configurations
@@ -73,16 +76,26 @@ no shell interpolation. Host sampling runs independently from Docker commands.
 | `Ctrl+U` | Clear text while filtering |
 | `s` / `x` / `r` | Start / stop / restart the selection |
 | `u` | Bring up the selected Compose project |
+| `a` | Attach to the selected running container |
 | `l` | Container logs |
 | `i` / `Enter` | Container inspect JSON |
 | `←` / `→`, `h` / `l` in logs/inspect | Pan horizontally |
 | `Shift+R` / `Ctrl+L` | Refresh Docker |
 | `?` / `F1` | Help |
 | `Ctrl+C` / `q` | Show exit reminder |
-| `Ctrl+Q` | Quit from anywhere |
+| `Ctrl+Q` | Quit efc; during Attach, detach back to efc |
 
 In confirmation dialogs, use `Tab` or arrows to choose, `Enter` to select,
 `y` to confirm, or `n` / `Esc` to cancel. The mouse can also click either button.
+
+Attach uses `docker attach --sig-proxy=false` and connects to the existing main
+process; it does not launch a new shell. Interactive input depends on whether the
+container was created with stdin/TTY support. Detach shortcuts work for both
+interactive and output-only containers. Ctrl+C is reserved for returning to efc
+and is never forwarded to the container. Host and Docker sampling continue while
+attached; your selected view and filter are restored when you return.
+For non-TTY containers configured with `StdinOnce`, efc uses output-only attach
+to avoid closing the process's stdin when disconnecting.
 
 ## Data & platform details
 
@@ -136,7 +149,9 @@ uv run --with pyte==0.8.2 python tests/terminal_smoke.py
 The PTY smoke test runs the actual binary against a temporary Docker CLI fixture,
 verifies container and multi-file Compose commands, navigates the screens, checks
 both log streams, confirms a real host socket is visible, and verifies terminal
-restoration. It never manages real containers. Unit tests cover parsing, timeouts,
+restoration. Attach checks cover raw Unicode and arrow input, terminal resizing,
+all detach shortcuts, mouse activation, natural exit and failure recovery.
+It never manages real containers. Unit tests cover parsing, timeouts,
 confirmation defaults, keyboard behavior, selection stability, and rendering at
 six terminal sizes. The fixture does not replace a real-workload start/stop
 check. You can verify a live connection and the empty state against `docker ps`.
@@ -151,6 +166,6 @@ efc --demo --snapshot /tmp/efc.txt
 
 ## Stack
 
-Rust · Ratatui · Crossterm · sysinfo · Docker CLI · Compose v2
+Rust · Ratatui · Crossterm · portable-pty · sysinfo · Docker CLI · Compose v2
 
 MIT license.

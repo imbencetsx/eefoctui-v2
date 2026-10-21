@@ -98,7 +98,7 @@ fn run_command(program: &str, args: &[String], timeout: Duration) -> Result<(Str
     Ok((out, err))
 }
 
-fn docker_executable() -> PathBuf {
+pub(crate) fn docker_executable() -> PathBuf {
     // An explicitly installed CLI on PATH always wins (including remote-engine
     // wrappers). Desktop's bundled CLI also works before PATH setup is finished.
     if cfg!(target_os = "macos") {
@@ -151,7 +151,7 @@ struct DockerRow {
     working_dir: String,
 }
 
-const PS_FORMAT: &str = r#"{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"State":{{json .State}},"Status":{{json .Status}},"Ports":{{json .Ports}},"Project":{{json (.Label "com.docker.compose.project")}},"Service":{{json (.Label "com.docker.compose.service")}},"ConfigFiles":{{json (.Label "com.docker.compose.project.config_files")}},"WorkingDir":{{json (.Label "com.docker.compose.project.working_dir")}}"#;
+const PS_FORMAT: &str = r#"{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"State":{{json .State}},"Status":{{json .Status}},"Ports":{{json .Ports}},"Project":{{json (.Label "com.docker.compose.project")}},"Service":{{json (.Label "com.docker.compose.service")}},"ConfigFiles":{{json (.Label "com.docker.compose.project.config_files")}},"WorkingDir":{{json (.Label "com.docker.compose.project.working_dir")}}}"#;
 
 pub fn parse_containers(output: &str) -> Result<Vec<Container>> {
     let mut containers = Vec::new();
@@ -226,10 +226,11 @@ fn snapshot(
     context: &mut String,
 ) -> DockerSnapshot {
     let mut snap = DockerSnapshot::default();
-    match docker(&["ps", "--all", "--no-trunc", "--format", PS_FORMAT])
-        .and_then(|s| parse_containers(&s))
-    {
-        Ok(containers) => snap.containers = containers,
+    match docker(&["ps", "--all", "--no-trunc", "--format", PS_FORMAT]) {
+        Ok(output) => match parse_containers(&output) {
+            Ok(containers) => snap.containers = containers,
+            Err(e) => snap.data_error = Some(format!("{e:#}")),
+        },
         Err(e) => {
             snap.error = Some(format!("{e:#}"));
             return snap;
