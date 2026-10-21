@@ -1,5 +1,6 @@
 use crate::{
     app::{App, Control, Popup, View, percent},
+    attach::Focus,
     model::*,
 };
 use ratatui::{
@@ -196,6 +197,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         return;
     }
+    if app.console.is_some() {
+        let header_area = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 3);
+        header(frame, app, header_area);
+        console(
+            frame,
+            app,
+            Rect::new(
+                area.x + 1,
+                area.y + 3,
+                area.width.saturating_sub(2),
+                area.height.saturating_sub(3),
+            ),
+        );
+        return;
+    }
     let inner = area.inner(Margin::new(1, 0));
     let roomy = area.height >= 26;
     let metrics_height = if area.height >= 32 { 5 } else { 0 };
@@ -245,6 +261,324 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.popup.is_some() {
         popup(frame, app, area);
+    }
+}
+
+fn terminal_color(color: vt100::Color, default: Color) -> Color {
+    match color {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn console(frame: &mut Frame, app: &mut App, area: Rect) {
+    let parts = rows(
+        area,
+        [
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ],
+    );
+    let session = app.console.as_mut().unwrap();
+    let body = if session.show_terminal {
+        rows(
+            parts[1],
+            [
+                Constraint::Percentage(55),
+                Constraint::Length(1),
+                Constraint::Percentage(45),
+            ],
+        )
+        .to_vec()
+    } else {
+        vec![parts[1], Rect::default(), Rect::default()]
+    };
+    let log_block = panel(format!(
+        " {}Log history · {} ",
+        if session.focus == Focus::Logs {
+            "▸ "
+        } else {
+            ""
+        },
+        if session.following { "live" } else { "paused" }
+    ))
+    .border_style(Style::default().fg(if session.focus == Focus::Logs {
+        GLACIER
+    } else {
+        WINE_EDGE
+    }));
+    let log_inner = log_block.inner(body[0]);
+    frame.render_widget(log_block, body[0]);
+    session.log_rect = body[0];
+    session.log_height = usize::from(log_inner.height).max(1);
+    session.clamp_logs();
+    let stats = session.history.stats();
+    let title = Line::from(vec![
+        Span::styled(
+            format!(
+                " {} / {}",
+                if session.show_terminal {
+                    "Attached workspace"
+                } else {
+                    "Container logs"
+                },
+                session.target.name
+            ),
+            Style::default().fg(GLACIER).bold(),
+        ),
+        Span::styled(
+            if session.demo { "   DEMO" } else { "" },
+            Style::default().fg(YELLOW),
+        ),
+        Span::styled(
+            format!("   {} lines · {}", stats.lines, bytes(stats.bytes)),
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    text(frame, parts[0], title);
+    let gutter = (stats.lines.max(1).to_string().len() as u16 + 2).min(12);
+    match session.history.page(session.top, session.log_height) {
+        Ok(lines) => {
+            let numbers: Vec<_> = (0..lines.len())
+                .map(|i| {
+                    Line::from(format!(
+                        "{:>width$} ",
+                        session.top + i + 1,
+                        width = usize::from(gutter.saturating_sub(1))
+                    ))
+                    .fg(MUTED)
+                })
+                .collect();
+            text(
+                frame,
+                Rect::new(
+                    log_inner.x,
+                    log_inner.y,
+                    gutter.min(log_inner.width),
+                    log_inner.height,
+                ),
+                numbers,
+            );
+            let logs: Vec<_> = lines
+                .into_iter()
+                .map(|line| {
+                    if !session.search_query.is_empty()
+                        && line
+                            .to_lowercase()
+                            .contains(&session.search_query.to_lowercase())
+                    {
+                        Line::from(line).fg(GLACIER).bg(SELECT)
+                    } else if line.contains("ERROR") || line.contains("WARN") {
+                        Line::from(line).fg(ROSE)
+                    } else {
+                        Line::from(line).fg(TEXT)
+                    }
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(logs).scroll((0, session.horizontal)),
+                Rect::new(
+                    log_inner.x + gutter.min(log_inner.width),
+                    log_inner.y,
+                    log_inner.width.saturating_sub(gutter + 1),
+                    log_inner.height,
+                ),
+            );
+        }
+        Err(e) => session.error = Some(format!("Could not read log history · {e:#}")),
+    }
+    if stats.lines == 0 {
+        text(
+            frame,
+            log_inner.inner(Margin::new(1, 0)),
+            vec![
+                Line::from("Waiting for retained logs and new output…").fg(MUTED),
+                Line::from("Docker must have a readable logging driver for this container.")
+                    .fg(MUTED),
+            ],
+        );
+    }
+    if stats.lines > session.log_height && log_inner.height > 0 && log_inner.width > 0 {
+        let track = usize::from(log_inner.height);
+        let thumb = (track * session.log_height / stats.lines).max(1).min(track);
+        let at =
+            (track - thumb) * session.top / stats.lines.saturating_sub(session.log_height).max(1);
+        for row in 0..track {
+            frame.buffer_mut()[(log_inner.right() - 1, log_inner.y + row as u16)]
+                .set_symbol(if row >= at && row < at + thumb {
+                    "┃"
+                } else {
+                    "│"
+                })
+                .set_fg(if session.following {
+                    GLACIER
+                } else {
+                    WINE_EDGE
+                });
+        }
+    }
+    session.terminal_rect = Rect::default();
+    if session.show_terminal {
+        let block = panel(format!(
+            " {}Terminal · {} ",
+            if session.focus == Focus::Terminal {
+                "▸ "
+            } else {
+                ""
+            },
+            session.terminal_status
+        ))
+        .border_style(Style::default().fg(if session.focus == Focus::Terminal {
+            GLACIER
+        } else {
+            WINE_EDGE
+        }));
+        let inner = block.inner(body[2]);
+        frame.render_widget(block, body[2]);
+        session.terminal_rect = body[2];
+        session.resize(inner.width, inner.height);
+        let screen = session.parser.screen();
+        for y in 0..inner.height {
+            for x in 0..inner.width {
+                if let Some(cell) = screen.cell(y, x) {
+                    let mut style = Style::default()
+                        .fg(terminal_color(cell.fgcolor(), TEXT))
+                        .bg(terminal_color(cell.bgcolor(), BG));
+                    for (enabled, modifier) in [
+                        (cell.bold(), Modifier::BOLD),
+                        (cell.dim(), Modifier::DIM),
+                        (cell.italic(), Modifier::ITALIC),
+                        (cell.underline(), Modifier::UNDERLINED),
+                        (cell.inverse(), Modifier::REVERSED),
+                    ] {
+                        if enabled {
+                            style = style.add_modifier(modifier);
+                        }
+                    }
+                    frame.buffer_mut()[(inner.x + x, inner.y + y)]
+                        .set_symbol(
+                            if cell.contents().is_empty() || cell.is_wide_continuation() {
+                                " "
+                            } else {
+                                cell.contents()
+                            },
+                        )
+                        .set_style(style);
+                }
+            }
+        }
+        if screen.contents().trim().is_empty() {
+            text(
+                frame,
+                inner.inner(Margin::new(1, 0)),
+                Line::from(
+                    session
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| session.terminal_status.clone()),
+                )
+                .fg(MUTED),
+            );
+        }
+        if session.focus == Focus::Terminal
+            && !screen.hide_cursor()
+            && screen.scrollback() == 0
+            && !session.search_edit
+        {
+            let (row, col) = screen.cursor_position();
+            if row < inner.height && col < inner.width {
+                frame.set_cursor_position((inner.x + col, inner.y + row));
+            }
+        }
+    }
+    let status = if session.search_edit {
+        format!(" / {}▏   Enter search · Esc cancel", session.search_query)
+    } else if let Some(e) = &session.error {
+        format!(" {e}")
+    } else if !session.search_status.is_empty() {
+        format!(" {} · n next · F2 live", session.search_status)
+    } else {
+        format!(
+            " Lines {}–{} / {} · {} · {}",
+            if stats.lines == 0 { 0 } else { session.top + 1 },
+            (session.top + session.log_height).min(stats.lines),
+            stats.lines,
+            if session.following {
+                "following"
+            } else {
+                "paused; new output stays captured"
+            },
+            session.log_status
+        )
+    };
+    text(
+        frame,
+        parts[3],
+        Line::from(status).fg(if session.error.is_some() { ROSE } else { MUTED }),
+    );
+    text(
+        frame,
+        parts[4],
+        Line::from(if session.focus == Focus::Terminal {
+            " Ctrl+W panes  PgUp/PgDn logs  Tab completes  Ctrl+Q / Ctrl+C back"
+        } else {
+            " ↑↓ scroll  Home/End first/live  ←→ pan  / search  n next  Ctrl+W terminal"
+        })
+        .fg(GLACIER),
+    );
+    let focus = session.focus;
+    let show_terminal = session.show_terminal;
+    let can_attach = session.can_attach;
+    let following = session.following;
+    let reconnect = show_terminal && can_attach && !session.is_connected();
+    let mut buttons = vec![
+        ("^Q  Back", Control::ConsoleClose, false, true),
+        (
+            "Logs",
+            Control::ConsoleFocus(Focus::Logs),
+            focus == Focus::Logs,
+            true,
+        ),
+        (
+            if show_terminal {
+                "Terminal"
+            } else {
+                "a  Attach"
+            },
+            if show_terminal {
+                Control::ConsoleFocus(Focus::Terminal)
+            } else {
+                Control::ConsoleAttach
+            },
+            focus == Focus::Terminal,
+            show_terminal || can_attach,
+        ),
+        ("F2  Live", Control::ConsoleFollow, following, true),
+        ("/  Search", Control::ConsoleSearch, false, true),
+    ];
+    if reconnect {
+        buttons.push(("a  Reattach", Control::ConsoleAttach, false, true));
+    }
+    let mut x = parts[2].x;
+    for (caption, control, selected, enabled) in buttons {
+        let width = 15.min(parts[2].right().saturating_sub(x));
+        if width < 11 {
+            break;
+        }
+        button(
+            frame,
+            app,
+            Rect::new(x, parts[2].y + u16::from(parts[2].height > 3), width, 3),
+            caption,
+            control,
+            ButtonState::new(selected, enabled),
+            GLACIER,
+        );
+        x += width;
     }
 }
 
@@ -1621,5 +1955,36 @@ mod tests {
             clean_text("\x1b[31merror\x1b[0m\n\x1b]52;c;secret\x07done"),
             "error\ndone"
         );
+    }
+    #[test]
+    fn embedded_workspace_keeps_panes_and_controls_inside_terminal_sizes() {
+        for (width, height) in [(58, 18), (80, 24), (100, 32), (124, 44), (156, 48)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut app = App::new(true, None);
+            app.control(Control::Attach);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let session = app.console.as_ref().unwrap();
+            assert!(session.terminal_rect.bottom() <= height);
+            assert!(session.log_rect.right() <= width);
+            assert_eq!(
+                session.parser.screen().size(),
+                (
+                    session.terminal_rect.height.saturating_sub(2).max(1),
+                    session.terminal_rect.width.saturating_sub(2).max(1),
+                )
+            );
+            assert!(
+                app.hits
+                    .iter()
+                    .any(|(_, c)| matches!(c, Control::ConsoleClose))
+            );
+            app.console.as_mut().unwrap().focus = Focus::Logs;
+            app.console.as_mut().unwrap().search_edit = true;
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            app.close_console();
+            app.control(Control::Logs);
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(!app.console.as_ref().unwrap().show_terminal);
+        }
     }
 }

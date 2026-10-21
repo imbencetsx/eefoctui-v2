@@ -1,6 +1,7 @@
 mod app;
 mod attach;
 mod backend;
+mod logs;
 mod model;
 mod ui;
 
@@ -9,8 +10,8 @@ use app::{App, Control, Popup, View};
 use clap::Parser;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
 };
@@ -36,6 +37,9 @@ use std::{
     after_help = "Inside efc: 1–4 switch views · ? help · Ctrl+Q quit\nDocker CLI and Compose v2 are needed for container management.\nHost metrics work without Docker. Try `efc --demo` to explore."
 )]
 struct Args {
+    /// Open the embedded console in demo mode.
+    #[arg(long, requires = "demo")]
+    demo_console: bool,
     /// Explore with clearly labeled sample data. Actions are simulated.
     #[arg(long)]
     demo: bool,
@@ -62,7 +66,7 @@ struct Args {
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -93,12 +97,16 @@ fn main() -> Result<()> {
     };
     let mut terminal = ratatui::try_init()?;
     let _restore = Restore;
+    execute!(io::stdout(), EnableBracketedPaste)?;
     if !args.no_mouse {
         execute!(io::stdout(), EnableMouseCapture)?;
     }
     let mut app = App::new(args.demo, sender);
     app.control(Control::View(args.view));
     app.pressed = None;
+    if args.demo_console {
+        app.control(Control::Attach);
+    }
     let mut last_demo = Instant::now();
     let mut tick = 0u64;
     while !app.quit {
@@ -116,17 +124,39 @@ fn main() -> Result<()> {
             app.last_docker = Some(Instant::now());
             last_demo = Instant::now();
         }
+        if let Some(session) = &mut app.console {
+            session.tick();
+        }
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(80))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.key(key),
+                Event::Paste(text) => {
+                    if let Some(session) = &mut app.console {
+                        session.paste(&text);
+                    }
+                }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(event::MouseButton::Left) => {
                         app.click(mouse.column, mouse.row)
                     }
                     MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                         let down = mouse.kind == MouseEventKind::ScrollDown;
-                        if matches!(app.popup, Some(Popup::Text { .. })) {
+                        if let Some(session) = &mut app.console {
+                            if session
+                                .terminal_rect
+                                .contains((mouse.column, mouse.row).into())
+                            {
+                                let current = session.parser.screen().scrollback();
+                                session.parser.screen_mut().set_scrollback(if down {
+                                    current.saturating_sub(3)
+                                } else {
+                                    current.saturating_add(3)
+                                });
+                            } else {
+                                session.scroll_logs(if down { 3 } else { -3 });
+                            }
+                        } else if matches!(app.popup, Some(Popup::Text { .. })) {
                             for _ in 0..3 {
                                 app.key(KeyEvent::new(
                                     if down { KeyCode::Down } else { KeyCode::Up },
@@ -142,48 +172,6 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
-        if let Some(target) = app.pending_attach.take() {
-            execute!(io::stdout(), DisableMouseCapture)?;
-            ratatui::restore();
-            let result = attach::run(&target, || {
-                if let Some(rx) = &receiver {
-                    while let Ok(update) = rx.try_recv() {
-                        app.update(update);
-                    }
-                }
-            });
-            terminal = ratatui::try_init()?;
-            if !args.no_mouse {
-                execute!(io::stdout(), EnableMouseCapture)?;
-            }
-            match result {
-                Ok(attach::Outcome::Detached) => {
-                    app.tell(format!("Detached · {}", target.name), false)
-                }
-                Ok(attach::Outcome::Exited { code: 0, .. }) => {
-                    app.tell(format!("Attach session ended · {}", target.name), false)
-                }
-                Ok(attach::Outcome::Exited { code, output }) => {
-                    app.popup = Some(Popup::Text {
-                        title: format!("Attach · {}", target.name),
-                        content: format!(
-                            "Attach exited with status {code}.\n\n{}",
-                            ui::clean_text(&output)
-                        ),
-                        scroll: 0,
-                        horizontal: 0,
-                    })
-                }
-                Err(error) => {
-                    app.popup = Some(Popup::Text {
-                        title: format!("Attach · {}", target.name),
-                        content: format!("{error:#}"),
-                        scroll: 0,
-                        horizontal: 0,
-                    })
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -193,6 +181,9 @@ fn snapshot(args: &Args, path: &std::path::Path) -> Result<()> {
     let mut app = App::new(true, None);
     app.control(Control::View(args.view));
     app.pressed = None;
+    if args.demo_console {
+        app.control(Control::Attach);
+    }
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     let buffer = terminal.backend().buffer();
     let html = path.extension().is_some_and(|s| s == "html");

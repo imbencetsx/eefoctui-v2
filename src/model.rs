@@ -175,7 +175,6 @@ pub struct AttachTarget {
 pub enum Request {
     Refresh,
     Action(Action),
-    Logs { id: String, name: String },
     Inspect { id: String, name: String },
 }
 

@@ -1,4 +1,8 @@
-use crate::{backend, model::*};
+use crate::{
+    attach::{Focus, Session},
+    backend,
+    model::*,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{layout::Rect, widgets::TableState};
 use std::{
@@ -65,6 +69,11 @@ pub enum Control {
     Quit,
     Filter,
     ClearFilter,
+    ConsoleClose,
+    ConsoleFocus(Focus),
+    ConsoleFollow,
+    ConsoleAttach,
+    ConsoleSearch,
 }
 
 pub struct Notice {
@@ -96,7 +105,7 @@ pub struct App {
     pub last_host: Option<Instant>,
     pub system_scroll: usize,
     pub pressed: Option<(String, Instant)>,
-    pub pending_attach: Option<AttachTarget>,
+    pub console: Option<Session>,
     sender: Option<SyncSender<Request>>,
 }
 
@@ -130,7 +139,7 @@ impl App {
             last_host: demo_mode.then(Instant::now),
             system_scroll: 0,
             pressed: None,
-            pending_attach: None,
+            console: None,
             sender,
         };
         if demo_mode {
@@ -483,7 +492,7 @@ impl App {
             Control::Start => self.request_action(Verb::Start),
             Control::Stop => self.request_action(Verb::Stop),
             Control::Restart => self.request_action(Verb::Restart),
-            Control::Attach => {
+            Control::Attach | Control::Logs => {
                 if self.view != View::Containers {
                     return;
                 }
@@ -493,16 +502,16 @@ impl App {
                     || self.docker.data_error.is_some()
                 {
                     self.tell(
-                        "Attach is unavailable while Docker is busy or disconnected",
+                        "Container console is unavailable while Docker is busy or disconnected",
                         true,
                     );
                     return;
                 }
                 let Some(c) = self.selected_container() else {
-                    self.tell("Select a running container to attach", false);
                     return;
                 };
-                if !c.running() {
+                let attach = matches!(control, Control::Attach);
+                if attach && !c.running() {
                     self.tell("Start this container before attaching", false);
                     return;
                 }
@@ -510,59 +519,57 @@ impl App {
                     id: c.id.clone(),
                     name: c.name.clone(),
                 };
-                if self.demo {
-                    self.popup = Some(Popup::Text {
-                        title: format!("Attach · {}", target.name),
-                        content: "DEMO · no real container is attached.\n\nIn live mode, Attach connects to the running container's main\nprocess with an interactive terminal.\n\nCtrl+Q or Ctrl+C detaches and returns to efc.\nCtrl+P, Ctrl+Q also detaches.\n\nAttach does not launch a shell or restart the container.".into(),
-                        scroll: 0, horizontal: 0,
-                    });
-                } else {
-                    self.pending_attach = Some(target);
+                match Session::open(target, attach, c.running(), self.demo) {
+                    Ok(session) => self.console = Some(session),
+                    Err(e) => self.tell(format!("Could not open container console · {e:#}"), true),
+                }
+            }
+            Control::ConsoleClose => self.close_console(),
+            Control::ConsoleFocus(focus) => {
+                if let Some(session) = &mut self.console {
+                    session.focus = focus;
+                }
+            }
+            Control::ConsoleFollow => {
+                if let Some(session) = &mut self.console {
+                    session.follow();
+                }
+            }
+            Control::ConsoleAttach => {
+                if let Some(session) = &mut self.console {
+                    session.attach();
+                }
+            }
+            Control::ConsoleSearch => {
+                if let Some(session) = &mut self.console {
+                    session.focus = Focus::Logs;
+                    session.search_edit = true;
                 }
             }
             Control::Up => self.request_action(Verb::Up),
-            Control::Logs | Control::Inspect => {
+            Control::Inspect => {
                 if self.view != View::Containers {
                     return;
                 }
                 let Some(c) = self.selected_container().cloned() else {
                     return;
                 };
-                let logs = matches!(control, Control::Logs);
-                let title = format!("{} · {}", if logs { "Logs" } else { "Inspect" }, c.name);
+                let title = format!("Inspect · {}", c.name);
                 if self.demo {
-                    let content = if logs {
-                        format!(
-                            "[DEMO · simulated logs]\n\n2026-10-20T16:47:20Z  INFO  {} starting\n2026-10-20T16:47:21Z  INFO  configuration loaded\n2026-10-20T16:47:21Z  INFO  health check passed\n2026-10-20T16:47:22Z  INFO  ready to accept connections\n\nLive mode shows the last 250 lines from docker logs.",
-                            c.name
-                        )
-                    } else {
-                        format!(
-                            "[DEMO · sample details]\n\nName: {}\nImage: {}\nID: {}\nProject: {}\nService: {}\nPorts: {}",
-                            c.name, c.image, c.id, c.project, c.service, c.ports
-                        )
-                    };
                     self.popup = Some(Popup::Text {
                         title,
-                        content,
+                        content: format!(
+                            "[DEMO · sample details]\n\nName: {}\nImage: {}\nID: {}\nProject: {}\nService: {}\nPorts: {}",
+                            c.name, c.image, c.id, c.project, c.service, c.ports
+                        ),
                         scroll: 0,
                         horizontal: 0,
                     });
-                } else {
-                    let req = if logs {
-                        Request::Logs {
-                            id: c.id,
-                            name: c.name,
-                        }
-                    } else {
-                        Request::Inspect {
-                            id: c.id,
-                            name: c.name,
-                        }
-                    };
-                    if self.send(req) {
-                        self.popup = Some(Popup::Loading { title });
-                    }
+                } else if self.send(Request::Inspect {
+                    id: c.id,
+                    name: c.name,
+                }) {
+                    self.popup = Some(Popup::Loading { title });
                 }
             }
             Control::Refresh => {
@@ -609,7 +616,20 @@ impl App {
         }
         self.clamp();
     }
+    pub fn close_console(&mut self) {
+        if let Some(session) = self.console.take() {
+            let name = session.target.name.clone();
+            drop(session);
+            self.tell(format!("Detached · {name}"), false);
+        }
+    }
     pub fn key(&mut self, key: KeyEvent) {
+        if let Some(session) = &mut self.console {
+            if session.key(key) {
+                self.close_console();
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('q') => {
@@ -783,6 +803,12 @@ impl App {
             .map(|(_, control)| control.clone());
         if let Some(control) = hit {
             self.control(control);
+        } else if let Some(session) = &mut self.console {
+            if session.log_rect.contains((x, y).into()) {
+                session.focus = Focus::Logs;
+            } else if session.terminal_rect.contains((x, y).into()) {
+                session.focus = Focus::Terminal;
+            }
         }
     }
 }
@@ -847,28 +873,29 @@ mod tests {
         assert!(!app.busy);
     }
     #[test]
-    fn attach_requires_a_running_container_and_respects_input_focus() {
+    fn attach_is_embedded_and_detaches_without_quitting_or_losing_filter() {
         let mut app = App::new(true, None);
+        app.query = "gateway".into();
         app.key(key(KeyCode::Char('a')));
-        assert!(matches!(app.popup, Some(Popup::Text { .. })));
-        assert!(app.pending_attach.is_none());
-        app.popup = None;
-        app.demo = false;
-        app.control(Control::Attach);
-        assert_eq!(
-            app.pending_attach.take().unwrap().id,
-            app.selected_container().unwrap().id
-        );
+        assert!(app.console.is_some());
+        app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.console.is_none());
+        assert!(!app.quit);
+        assert_eq!(app.query, "gateway");
+        app.query.clear();
         app.busy = true;
         app.control(Control::Attach);
-        assert!(app.pending_attach.is_none());
+        assert!(app.console.is_none());
         app.busy = false;
         app.docker.containers[0].state = "exited".into();
         app.control(Control::Attach);
-        assert!(app.pending_attach.is_none());
+        assert!(app.console.is_none());
+        app.control(Control::Logs);
+        assert!(app.console.is_some());
+        app.key(key(KeyCode::Esc));
         app.key(key(KeyCode::Char('/')));
         app.key(key(KeyCode::Char('a')));
         assert_eq!(app.query, "a");
-        assert!(app.pending_attach.is_none());
+        assert!(app.console.is_none());
     }
 }

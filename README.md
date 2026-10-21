@@ -28,6 +28,7 @@ From the project, you can also use `cargo run --release --`.
 
 ```sh
 efc --demo                          # Simulated environment, no Docker needed
+efc --demo --demo-console           # Explore the embedded terminal + log history
 efc --compose ./compose.yaml         # Load a stack, including an uncreated one
 efc --view ports                     # Open directly to port inspection
 efc --view system --no-mouse         # Host monitor; allow native text selection
@@ -42,9 +43,11 @@ to use `Ctrl+Q`; exiting efc leaves containers running.
 
 - **Containers:** start, gracefully stop, and restart; inspect state, image, Compose
   service, ports, CPU, memory, network I/O, block I/O, process count, and CPU history.
-  Open the last 250 log lines (both stdout and stderr) or the complete inspect JSON.
-  Use **Attach** to connect to a running container's main process, with live output,
-  keyboard input and terminal resizing. **Ctrl+Q**, **Ctrl+C**, or **Ctrl+P then
+  Open complete available log history (stdout and stderr) with live following,
+  scrolling, horizontal panning, line numbers and search, or the complete inspect JSON.
+  Use **Attach** for an embedded workspace: log history above, the running
+  container's main-process terminal below, with ANSI colors, cursor movement,
+  keyboard input, paste and terminal resizing. **Ctrl+Q**, **Ctrl+C**, or **Ctrl+P then
   Ctrl+Q** detach and return to efc while keeping the container running.
 - **Compose:** automatically discover projects through labels on all containers,
   including stopped ones. Start, stop, or restart a whole project; bring up missing
@@ -59,8 +62,9 @@ to use `Ctrl+Q`; exiting efc leaves containers running.
   actions and results. This is an in-memory session log.
 
 Stops, restarts, and Compose up require confirmation; **Cancel is selected by
-default**. Commands run in a background worker with timeouts, bounded output, and
-no shell interpolation. Host sampling runs independently from Docker commands.
+default**. Collection and management commands run in a background worker with timeouts,
+bounded output, and no shell interpolation. Log streaming uses a session history
+file instead of a fixed output limit. Host sampling runs independently from Docker commands.
 
 ## Keys
 
@@ -77,16 +81,45 @@ no shell interpolation. Host sampling runs independently from Docker commands.
 | `s` / `x` / `r` | Start / stop / restart the selection |
 | `u` | Bring up the selected Compose project |
 | `a` | Attach to the selected running container |
-| `l` | Container logs |
+| `l` | Complete, live container log history |
 | `i` / `Enter` | Container inspect JSON |
 | `←` / `→`, `h` / `l` in logs/inspect | Pan horizontally |
 | `Shift+R` / `Ctrl+L` | Refresh Docker |
 | `?` / `F1` | Help |
 | `Ctrl+C` / `q` | Show exit reminder |
-| `Ctrl+Q` | Quit efc; during Attach, detach back to efc |
+| `Ctrl+Q` | Quit efc; in the container workspace, return to the container list |
 
 In confirmation dialogs, use `Tab` or arrows to choose, `Enter` to select,
 `y` to confirm, or `n` / `Esc` to cancel. The mouse can also click either button.
+
+## Embedded terminal & logs
+
+The **Attach** button (`a`) opens both panes inside efc. **Logs** (`l`) opens the
+same history viewer without attaching stdin; stopped containers can be viewed too.
+The focused pane has a glacier border and a `▸` marker. Click a pane or its keycap,
+or press **Ctrl+W** / **Shift+Tab**, to change focus. Ordinary keys, including Tab
+completion and Escape, reach the main process while the terminal has focus.
+
+| In the container workspace | Action |
+| --- | --- |
+| `Ctrl+W` / `Shift+Tab` | Switch logs / terminal focus |
+| Mouse wheel over logs | Scroll log history and pause follow |
+| Mouse wheel over terminal | Scroll terminal screen history |
+| `PgUp` / `PgDn` | Focus logs and scroll a page |
+| `↑` / `↓`, `j` / `k` in logs | Scroll a line |
+| `Home` / `g` in logs | First captured log line |
+| `End` / `G` / `f` in logs, or `F2` anywhere | Resume live following |
+| `←` / `→`, `h` / `l` in logs | Pan long lines horizontally |
+| `/` in logs | Search all captured history; Enter finds, Esc cancels input |
+| `n` / `F3` in logs | Find the next match, wrapping once |
+| `a` in logs / Attach or Reattach button | Attach to the running main process |
+| `Ctrl+Q` / `Ctrl+C` | Close the workspace and detach |
+| `Esc` in logs | Close the workspace |
+
+Scrolling pauses the viewport, while capture continues. New output does not move
+your reading position. Search runs in the background. When the attached process
+ends or attach fails, the final terminal screen and logs remain visible until you
+close the workspace. A failed or ended attach can be retried with **Reattach**.
 
 Attach uses `docker attach --sig-proxy=false` and connects to the existing main
 process; it does not launch a new shell. Interactive input depends on whether the
@@ -128,13 +161,29 @@ files and their environment/secrets to remain available locally. Start only star
 existing containers; **Bring up** can pull images and create missing services.
 efc does not remove containers, images, networks, or volumes.
 
-Logs and inspect are on-demand snapshots. Reopen them to refresh. Both log streams
-are retained, with stderr under a separate heading; cross-stream order is not
-reconstructed. Output is capped at 2 MiB per stream. Collection commands time out
-after 12 seconds, host socket commands after 3, and actions after 120. A timed-out
-action may already have changed engine state; refresh before retrying. Quitting
-does not cancel an in-flight Docker operation. Demo mode is explicitly labeled and
-never sends Docker commands.
+Logs use `docker logs --follow --timestamps --tail all`: all history still
+retained by Docker is streamed, followed by new output. efc imposes no 250-line,
+65,535-line or 2 MiB log cap. Raw history is written to a private temporary file;
+only the visible page is decoded for rendering, with an in-memory line offset
+index. History grows until you close the workspace or available disk fills.
+The temporary file is removed when the session closes. Log availability depends
+on the container's logging driver and rotation policy: already rotated/deleted
+logs cannot be recovered. Both output streams share one capture terminal and are
+displayed in arrival order. Log escape codes are displayed as plain text; the
+interactive terminal interprets screen operations inside its own pane.
+
+The interactive terminal retains 10,000 screen rows for wheel scrolling; the
+separate Docker log history has no fixed line limit. Clipboard/title escape
+sequences from a container do not execute on the host terminal. Input forwarding
+runs independently so a main process that stops reading cannot prevent detaching.
+
+Inspect remains an on-demand snapshot, capped at 2 MiB per output stream.
+Collection commands time out after 12 seconds, host socket commands after 3,
+and actions after 120. Live logs and attached terminals have no session timeout.
+A timed-out action may already have changed engine state; refresh before retrying.
+Quitting does not cancel an in-flight Docker operation. Closing a workspace stops
+its local log/attach clients. Demo mode is explicitly labeled and never sends
+Docker commands.
 
 ## Development & checks
 
@@ -150,7 +199,10 @@ The PTY smoke test runs the actual binary against a temporary Docker CLI fixture
 verifies container and multi-file Compose commands, navigates the screens, checks
 both log streams, confirms a real host socket is visible, and verifies terminal
 restoration. Attach checks cover raw Unicode and arrow input, terminal resizing,
-all detach shortcuts, mouse activation, natural exit and failure recovery.
+all detach shortcuts, mouse activation, natural exit and failure recovery. Embedded
+workspace checks exercise 70,000+ lines and >2 MiB, first/last/page scrolling,
+paused capture, full-history search, Unicode paste, pane resize and focus,
+continued TUI rendering, and detachment while container stdin is blocked.
 It never manages real containers. Unit tests cover parsing, timeouts,
 confirmation defaults, keyboard behavior, selection stability, and rendering at
 six terminal sizes. The fixture does not replace a real-workload start/stop
@@ -160,12 +212,13 @@ Capture the **actual Ratatui buffer** as a self-contained HTML preview or text:
 
 ```sh
 efc --demo --snapshot docs/preview-containers.html
+efc --demo --demo-console --width 124 --height 44 --snapshot docs/preview-console.html
 efc --demo --view system --width 120 --height 36 --snapshot docs/preview-system.html
 efc --demo --snapshot /tmp/efc.txt
 ```
 
 ## Stack
 
-Rust · Ratatui · Crossterm · portable-pty · sysinfo · Docker CLI · Compose v2
+Rust · Ratatui · Crossterm · portable-pty · vt100 · sysinfo · Docker CLI · Compose v2
 
 MIT license.

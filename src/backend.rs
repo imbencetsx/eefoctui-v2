@@ -336,25 +336,6 @@ pub fn spawn(compose: Option<PathBuf>) -> (SyncSender<Request>, Receiver<Update>
                         let _ = docker_tx.send(Update::ActionDone(result));
                         break;
                     }
-                    Ok(Request::Logs { id, name }) => {
-                        let args = ["logs", "--tail", "250", "--timestamps", &id]
-                            .into_iter()
-                            .map(String::from)
-                            .collect::<Vec<_>>();
-                        let content = run_command("docker", &args, Duration::from_secs(12))
-                            .map(|(stdout, stderr)| {
-                                if stderr.is_empty() {
-                                    stdout
-                                } else {
-                                    format!("{stdout}\n── stderr ──\n{stderr}")
-                                }
-                            })
-                            .map_err(|e| format!("{e:#}"));
-                        let _ = docker_tx.send(Update::Text {
-                            title: format!("Logs · {name}"),
-                            content,
-                        });
-                    }
                     Ok(Request::Inspect { id, name }) => {
                         let content = docker(&["inspect", &id])
                             .and_then(|s| {

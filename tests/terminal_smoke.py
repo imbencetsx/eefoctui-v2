@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import socket
@@ -137,8 +138,16 @@ elif args[0] in ("start", "stop", "restart"):
     state_path.write_text(json.dumps(state))
     print(name)
 elif args[0] == "logs":
-    print("fixture standard output")
-    print("fixture standard error", file=sys.stderr)
+    assert args[1:] == ["--follow", "--timestamps", "--tail", "all", "--", "id-api"] or args[-1] == "id-redis"
+    if os.environ.get("EFC_LARGE_LOGS"):
+        sys.stdout.write("".join(f"2026-10-21T12:00:00Z HISTORY-{i:06} complete retained history " + "x" * 40 + "\n" for i in range(70000)))
+    print("fixture standard output", flush=True)
+    print("fixture standard error", file=sys.stderr, flush=True)
+    if os.environ.get("EFC_LARGE_LOGS"):
+        import time
+        for i in range(1000):
+            print(f"LIVE-{i:04} new output still being captured", flush=True)
+            time.sleep(0.1)
 elif args[0] == "inspect":
     if "--format" in args:
         assert args[args.index("--format") + 1] == "{{json .Config}}"
@@ -162,6 +171,10 @@ elif args[0] == "attach":
         os.write(1, f"\r\nATTACH RESIZE {size.columns}x{size.lines}\r\n".encode())
     signal.signal(signal.SIGWINCH, resized)
     os.write(1, b"\r\nATTACH READY\r\n")
+    if os.environ.get("EFC_ATTACH_NOT_READING"):
+        import time
+        time.sleep(60)
+    received = bytearray()
     while True:
         data = os.read(0, 4096)
         if not data:
@@ -169,7 +182,8 @@ elif args[0] == "attach":
         with (root / "attach-input").open("ab") as out:
             out.write(data)
         os.write(1, b"\r\nATTACH INPUT " + data.hex().encode() + b"\r\n")
-        if b"exit" in data:
+        received.extend(data)
+        if b"exit\r" in received:
             break
 elif args[0] == "compose":
     if "config" in args:
@@ -217,6 +231,8 @@ def demo_flow():
         terminal.until("System information")
         terminal.send("1/redis\rl")
         terminal.until("simulated logs")
+        terminal.send("\x1b")
+        terminal.until("Detached · redis")
         terminal.quit()
     finally:
         terminal.close()
@@ -301,7 +317,8 @@ def attach_flow(root):
         terminal.send("héllo\x1b[A\r")
         terminal.until("ATTACH INPUT")
         terminal.resize(124, 38)
-        terminal.until("ATTACH RESIZE 124x38")
+        terminal.until("ATTACH RESIZE")
+        assert "124x38" not in terminal.text(), "Child received whole-screen dimensions instead of its pane"
         terminal.send("\x11")
         terminal.until("Detached · api")
         terminal.until("fake-context")
@@ -324,13 +341,16 @@ def attach_flow(root):
         terminal.send("a")
         terminal.until("ATTACH READY")
         terminal.send("exit\r")
-        terminal.until("Attach session ended · api")
+        terminal.until("Attach session ended")
+        terminal.until("Attached workspace / api")
+        terminal.send("\x11")
+        terminal.until("Detached · api")
         terminal.quit()
     finally:
         terminal.close()
     for extra, expected in [
         ({"EFC_ATTACH_CANONICAL": "1"}, "Detached · api"),
-        ({"EFC_ATTACH_FAIL": "1"}, "Attach exited with status 42."),
+        ({"EFC_ATTACH_FAIL": "1"}, "Attach exited with status 42"),
     ]:
         terminal = Terminal([], dict(env, **extra))
         try:
@@ -339,8 +359,8 @@ def attach_flow(root):
             if "EFC_ATTACH_FAIL" in extra:
                 terminal.until(expected)
                 terminal.until("fixture attach refused")
-                terminal.send("\x1b")
-                terminal.pump()
+                terminal.send("\x11")
+                terminal.until("Detached · api")
             else:
                 terminal.until("ATTACH READY")
                 terminal.until("Output-only session")
@@ -357,6 +377,70 @@ def attach_flow(root):
     print("PASS Attach button/shortcut, raw Unicode/arrows, resize, Ctrl+Q/Ctrl+C/Ctrl+P,Q detach, natural exit, failure and terminal restoration")
 
 
+def embedded_history_flow(root):
+    env = dict(PATH=str(root) + os.pathsep + os.environ["PATH"], EFC_FIXTURE=str(root), EFC_LARGE_LOGS="1")
+    terminal = Terminal([], env)
+    try:
+        terminal.until("fake-context")
+        terminal.send("a")
+        terminal.until("Attached workspace / api")
+        terminal.until("ATTACH READY")
+        terminal.until("LIVE-")
+        assert b"\x1b[?1049l" not in terminal.output, "Attach left the TUI's alternate screen"
+        # Ctrl+W gives logs focus; Home reaches history beyond both old limits.
+        terminal.send("\x17\x1b[H")
+        terminal.until("HISTORY-000000")
+        def total():
+            return int(re.search(r"(\d+) lines", terminal.text()).group(1))
+        before = total()
+        assert before > 70000, before
+        terminal.pump(0.8)
+        assert "HISTORY-000000" in terminal.text(), "Live output moved the paused viewport"
+        assert total() > before, "Paused history stopped capturing new output"
+        terminal.send("\x1b[6~")
+        terminal.until("HISTORY-0000")
+        assert "HISTORY-000000" not in terminal.text(), "PageDown did not scroll"
+        terminal.send("/HISTORY-010123\r")
+        terminal.until("Match on line 10124")
+        terminal.until("HISTORY-010123")
+        terminal.send("\x1b[F")
+        terminal.until("LIVE-")
+        terminal.until("following")
+        # Click inside the terminal: subsequent ordinary keys go to the process.
+        row = next(y for y, line in enumerate(terminal.screen.display) if "Terminal ·" in line)
+        terminal.send(f"\x1b[<0;5;{row + 3}M\x1b[<0;5;{row + 3}m")
+        terminal.send("\x1b[200~pasted é\t\x1b[201~")
+        terminal.until("ATTACH INPUT")
+        terminal.pump(0.2)
+        assert b"pasted \xc3\xa9\t" in (root / "attach-input").read_bytes()
+        # While focused in the terminal, PageUp safely switches to log history.
+        terminal.send("\x1b[5~")
+        terminal.until("paused")
+        terminal.send("\x11")
+        terminal.until("Detached · api")
+        terminal.quit()
+    finally:
+        terminal.close()
+    print("PASS embedded panes, 70,000+ historical lines, >2 MiB, Home/End/pages, pause with live capture, full-history search, mouse focus, Unicode paste and no terminal handoff")
+
+
+def blocked_input_flow(root):
+    env = dict(PATH=str(root) + os.pathsep + os.environ["PATH"], EFC_FIXTURE=str(root), EFC_ATTACH_NOT_READING="1")
+    terminal = Terminal([], env)
+    try:
+        terminal.until("fake-context")
+        terminal.send("a")
+        terminal.until("ATTACH READY")
+        terminal.send("\x1b[200~" + "x" * 32768 + "\x1b[201~")
+        terminal.pump(0.2)
+        terminal.send("\x11")
+        terminal.until("Detached · api", timeout=3)
+        terminal.quit()
+    finally:
+        terminal.close()
+    print("PASS unresponsive container stdin cannot block UI or detach")
+
+
 if __name__ == "__main__":
     assert BINARY.exists(), "Run cargo build first"
     demo_flow()
@@ -364,3 +448,5 @@ if __name__ == "__main__":
         live_fixture_flow(Path(directory))
         malformed_output_flow(Path(directory))
         attach_flow(Path(directory))
+        embedded_history_flow(Path(directory))
+        blocked_input_flow(Path(directory))
